@@ -1,0 +1,14 @@
+apiVersion: v2
+name: phoenix-liveview
+description: Production Helm chart for the Phoenix LiveView app on AWS EKS — tuned for long-lived WebSockets, bursty traffic, and graceful draining.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - phoenix
+  - elixir
+  - liveview
+  - websockets
+  - eks
+maintainers:
+  - name: DevOps

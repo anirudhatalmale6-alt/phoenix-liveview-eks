@@ -1,0 +1,16 @@
+{{ .Chart.Name }} {{ .Chart.AppVersion }} deployed as release "{{ .Release.Name }}".
+
+Replicas:        {{ if .Values.autoscaling.enabled }}HPA {{ .Values.autoscaling.minReplicas }}–{{ .Values.autoscaling.maxReplicas }} (CPU {{ .Values.autoscaling.targetCPUUtilizationPercentage }}%){{ else }}{{ .Values.replicaCount }} (static){{ end }}
+Service:         {{ include "phoenix-liveview.fullname" . }}:{{ .Values.service.port }} ({{ .Values.service.type }}, sessionAffinity={{ .Values.service.sessionAffinity }})
+Graceful drain:  terminationGracePeriodSeconds={{ .Values.terminationGracePeriodSeconds }}s, preStop sleep={{ .Values.lifecycle.preStopSleepSeconds }}s
+PDB:             {{ if .Values.podDisruptionBudget.enabled }}minAvailable={{ .Values.podDisruptionBudget.minAvailable }}{{ else }}disabled{{ end }}
+
+Next:
+  1) Point image.repository/tag at your pushed image (ECR/GHCR).
+  2) In production set secret.existingSecret to a Secret containing DATABASE_URL
+     and SECRET_KEY_BASE (managed by External Secrets / SecretsManager CSI).
+  3) Enable ingress.enabled=true and set ingress.host once the ALB controller is ready.
+
+Check rollout:
+  kubectl rollout status deploy/{{ include "phoenix-liveview.fullname" . }}
+  kubectl get hpa {{ include "phoenix-liveview.fullname" . }}

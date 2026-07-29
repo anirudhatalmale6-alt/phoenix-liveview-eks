@@ -1,0 +1,241 @@
+# ---------------------------------------------------------------------------
+# Default values for the phoenix-liveview chart.
+# Every knob relevant to running a latency-sensitive, WebSocket-heavy Phoenix
+# app on EKS is exposed here. See DECISIONS.md for the reasoning behind the
+# non-obvious defaults (no CPU limit, maxUnavailable=0, PDB, drain timings...).
+# ---------------------------------------------------------------------------
+
+replicaCount: 3
+
+image:
+  repository: ghcr.io/example/phoenix-liveview
+  tag: "" # defaults to .Chart.AppVersion when empty
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {} # e.g. eks.amazonaws.com/role-arn for IRSA
+
+# --- Application configuration (non-secret) -> ConfigMap -------------------
+config:
+  PHX_HOST: "phoenix.example.com"
+  PORT: "4000"
+  POOL_SIZE: "10"
+  # RDS over TLS. Set to "true" and mount the RDS CA bundle (see database.caBundle)
+  # to get verify_peer; leave empty for plaintext (not recommended for RDS).
+  DATABASE_SSL: "true"
+  # Extra plain env vars merged as-is.
+  extraEnv: {}
+
+# --- Secrets ---------------------------------------------------------------
+# No secret is ever baked into the image. The pod reads DATABASE_URL and
+# SECRET_KEY_BASE from a Kubernetes Secret. In real EKS use an existing Secret
+# managed by External Secrets Operator / SecretsManager CSI and set
+# `existingSecret`. The inline `create` path is for demo/lab only.
+secret:
+  existingSecret: ""
+  create: false
+  data:
+    DATABASE_URL: "ecto://user:pass@your-rds-endpoint:5432/demo_prod"
+    SECRET_KEY_BASE: "REPLACE_WITH_mix_phx.gen.secret"
+
+# Optional RDS CA bundle mounted read-only for verify_peer TLS.
+database:
+  caBundle:
+    enabled: false
+    # Name of a ConfigMap/Secret key holding the PEM. When enabled, mounted at
+    # /etc/ssl/rds/ca.pem and exposed as DATABASE_SSL_CA_CERT.
+    existingConfigMap: "rds-ca-bundle"
+    key: "ca.pem"
+
+# --- Service ---------------------------------------------------------------
+# ClusterIP behind an ALB Ingress. LiveView needs the client to keep talking to
+# a live pod; sticky routing is done at the Ingress (cookie) — see ingress. We
+# also enable ClientIP session affinity on the Service as a second layer so
+# intra-cluster clients reconnect to the same pod when possible.
+service:
+  type: ClusterIP
+  port: 80
+  sessionAffinity: ClientIP
+  sessionAffinityTimeoutSeconds: 10800
+  annotations: {}
+
+# --- Ingress (AWS ALB) -----------------------------------------------------
+ingress:
+  enabled: false
+  className: alb
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    # Health check hits the cheap liveness path, not a LiveView route.
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
+    # Sticky sessions so a browser keeps landing on the same pod (stable LiveView).
+    alb.ingress.kubernetes.io/target-group-attributes: stickiness.enabled=true,stickiness.type=lb_cookie,stickiness.lb_cookie.duration_seconds=10800
+    # Drain in-flight requests from the target group before a pod is removed.
+    alb.ingress.kubernetes.io/target-group-attributes-deregistration_delay: "30"
+  host: phoenix.example.com
+  path: /
+  pathType: Prefix
+  tls: []
+
+# --- Resources -------------------------------------------------------------
+# Requests are set for reliable scheduling and as the HPA denominator. A memory
+# LIMIT is set (OOM protection). NO CPU LIMIT by default: CFS throttling adds
+# tail latency to a latency-sensitive service, and the BEAM already spreads work
+# across schedulers. Set autoscaling on CPU *requests* utilisation instead.
+resources:
+  requests:
+    cpu: "250m"
+    memory: "300Mi"
+  limits:
+    memory: "512Mi"
+    # cpu: intentionally unset (see above). Uncomment to cap.
+
+# --- Autoscaling -----------------------------------------------------------
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 12
+  # Primary signal: CPU utilisation vs requests. For this app CPU tracks the
+  # real cost of pushing LiveView diffs over WebSockets and is available without
+  # a metrics adapter, so it is the pragmatic default. See DECISIONS.md.
+  targetCPUUtilizationPercentage: 60
+  # Optional memory ceiling as a secondary guard against slow leaks / big states.
+  targetMemoryUtilizationPercentage: 80
+  # Optional connection-based signal (the *ideal* signal for a WS server). Needs
+  # Prometheus Adapter exposing a per-pod metric (e.g. active WS connections).
+  # Disabled by default because it requires cluster-side wiring.
+  customConnectionMetric:
+    enabled: false
+    name: phoenix_live_view_connected_clients
+    averageValue: "500"
+  behavior:
+    scaleUp:
+      # React fast to bursty peaks: no wait, allow doubling / +4 pods per 15s.
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+        - type: Pods
+          value: 4
+          periodSeconds: 15
+      selectPolicy: Max
+    scaleDown:
+      # Scale down slowly so we don't yank pods (and their sockets) after a
+      # short lull. 5 min stabilisation, at most 1 pod per minute.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+      selectPolicy: Min
+
+# --- PodDisruptionBudget ---------------------------------------------------
+# Guarantee capacity survives voluntary disruptions (node drain, upgrade) so a
+# whole AZ of sockets is never dropped at once.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: "50%"
+
+# --- Rollout / graceful shutdown ------------------------------------------
+# maxUnavailable=0 keeps full capacity during a deploy (somewhere for sockets to
+# reconnect); maxSurge adds pods before old ones leave.
+strategy:
+  maxUnavailable: 0
+  maxSurge: 1
+
+# Must exceed the endpoint drainer shutdown (30s) + preStop sleep so the kubelet
+# never SIGKILLs a pod mid-drain.
+terminationGracePeriodSeconds: 90
+
+# preStop delay: lets Ingress/Service endpoints stop routing NEW connections to
+# this pod before SIGTERM starts draining EXISTING ones. Removes the race where
+# a pod is still receiving traffic as it begins shutting down.
+lifecycle:
+  preStopSleepSeconds: 15
+
+# --- Probes ----------------------------------------------------------------
+# startup: covers slow boot without a lax liveness. liveness: cheap, no DB.
+# readiness: checks DB — a pod that can't reach RDS is pulled from endpoints.
+probes:
+  startup:
+    path: /healthz
+    failureThreshold: 30
+    periodSeconds: 2
+  liveness:
+    path: /healthz
+    initialDelaySeconds: 0
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    path: /healthz/ready
+    initialDelaySeconds: 2
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+# --- Migrations ------------------------------------------------------------
+# Runs `bin/migrate` once per release as a Helm pre-install/pre-upgrade hook Job,
+# so N replicas never race to migrate. Disable if you migrate out of band.
+migrations:
+  enabled: true
+  backoffLimit: 3
+  activeDeadlineSeconds: 600
+
+# --- Scheduling / spreading ------------------------------------------------
+# Spread replicas across nodes and AZs so a single node/AZ loss can't take the
+# whole fleet (and its sockets) down.
+topologySpread:
+  enabled: true
+  maxSkew: 1
+  topologyKey: topology.kubernetes.io/zone
+  whenUnsatisfiable: ScheduleAnyway
+
+podAntiAffinity:
+  enabled: true
+  type: soft # soft|hard
+  topologyKey: kubernetes.io/hostname
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# --- Security --------------------------------------------------------------
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  capabilities:
+    drop:
+      - ALL
+
+# Writable tmp for the read-only rootfs (Erlang crash dumps, tmp).
+extraVolumes: []
+extraVolumeMounts: []
+
+# --- Observability ---------------------------------------------------------
+serviceMonitor:
+  enabled: false
+  interval: 15s
+  path: /metrics
+  port: http
+
+podAnnotations: {}
+podLabels: {}

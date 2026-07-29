@@ -1,0 +1,45 @@
+{{- if .Values.autoscaling.enabled -}}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "phoenix-liveview.fullname" . }}
+  labels:
+    {{- include "phoenix-liveview.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "phoenix-liveview.fullname" . }}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  metrics:
+    {{- if .Values.autoscaling.targetCPUUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
+    {{- end }}
+    {{- if .Values.autoscaling.targetMemoryUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetMemoryUtilizationPercentage }}
+    {{- end }}
+    {{- if .Values.autoscaling.customConnectionMetric.enabled }}
+    # Ideal signal for a WebSocket server: average active LiveView connections
+    # per pod. Requires Prometheus Adapter to surface this Pods metric.
+    - type: Pods
+      pods:
+        metric:
+          name: {{ .Values.autoscaling.customConnectionMetric.name }}
+        target:
+          type: AverageValue
+          averageValue: {{ .Values.autoscaling.customConnectionMetric.averageValue | quote }}
+    {{- end }}
+  behavior:
+    {{- toYaml .Values.autoscaling.behavior | nindent 4 }}
+{{- end }}

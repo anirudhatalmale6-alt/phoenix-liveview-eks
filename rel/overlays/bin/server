@@ -1,0 +1,8 @@
+#!/bin/sh
+# Start the Phoenix server from inside the release.
+# PHX_SERVER=true tells config/runtime.exs to boot the web endpoint.
+# `exec` replaces this shell so the BEAM becomes the entrypoint process (PID 1
+# in the container) and receives SIGTERM directly for graceful shutdown.
+set -eu
+cd -P -- "$(dirname -- "$0")/.."
+PHX_SERVER=true exec ./bin/demo start

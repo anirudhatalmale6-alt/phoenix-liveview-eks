@@ -1,0 +1,77 @@
+{{- if .Values.migrations.enabled -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # Unique per revision so each upgrade gets a fresh Job (immutable Jobs).
+  name: {{ include "phoenix-liveview.fullname" . }}-migrate-{{ .Release.Revision }}
+  labels:
+    {{- include "phoenix-liveview.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    # Run migrations exactly once, before app pods start/upgrade — no replica race.
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.migrations.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.migrations.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "phoenix-liveview.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "phoenix-liveview.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: migrate
+          image: {{ include "phoenix-liveview.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          command: ["/app/bin/migrate"]
+          # Explicit env (not the ConfigMap) so this pre-install hook has no
+          # dependency on non-hook resources that Helm creates after hooks.
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "phoenix-liveview.secretName" . }}
+                  key: DATABASE_URL
+            - name: SECRET_KEY_BASE
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "phoenix-liveview.secretName" . }}
+                  key: SECRET_KEY_BASE
+            - name: DATABASE_SSL
+              value: {{ .Values.config.DATABASE_SSL | quote }}
+            - name: POOL_SIZE
+              value: {{ .Values.config.POOL_SIZE | quote }}
+            {{- if .Values.database.caBundle.enabled }}
+            - name: DATABASE_SSL_CA_CERT
+              value: "/etc/ssl/rds/{{ .Values.database.caBundle.key }}"
+            {{- end }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.database.caBundle.enabled }}
+            - name: rds-ca
+              mountPath: /etc/ssl/rds
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.database.caBundle.enabled }}
+        - name: rds-ca
+          configMap:
+            name: {{ .Values.database.caBundle.existingConfigMap }}
+        {{- end }}
+{{- end }}
